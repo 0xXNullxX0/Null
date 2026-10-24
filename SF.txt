@@ -1,0 +1,1523 @@
+// ==UserScript==
+// @name         Shahid Salesforce Helper (Evergent Autofill + Click-to-Copy + Status Colors)
+// @namespace    https://shahidmbc.lightning.force.com/
+// @version      2.2.0
+// @description  Ctrl+V an Evergent account page on a Salesforce Account to fill the form. One click on a field copies its value. Case statuses get colors.
+// @match        https://shahidmbc.lightning.force.com/*
+// @run-at       document-idle
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+/*
+ * HOW TO USE
+ * ----------
+ * 1) Evergent: open the account, press Ctrl+A, then Ctrl+C.
+ * 2) Salesforce: open the Account (or "New Account"), click on an empty part of
+ *    the page and press Ctrl+V. The form opens in edit mode and the fields are
+ *    filled. Nothing is saved: check the values and click Save yourself.
+ *    - Ctrl+V inside a field is a normal paste. Only a full Evergent page is
+ *      caught there (it is never meant for one field).
+ *    - The blue "EV" button (or Alt+Q) shows the details of the last paste.
+ *      It is cleared when you open another profile or a new one.
+ * 3) On an Account page, ONE click on a field value copies it.
+ *    Double click still opens edit mode (it does not copy).
+ *    Hold Ctrl while clicking to use a link normally (phone, email, user).
+ *
+ * CONSOLE USE: press F12 > Console, paste this whole script, press Enter.
+ * A message "SF Helper v... is on" appears at the bottom of the page.
+ * It keeps working while you move between Salesforce pages, but a page
+ * refresh (F5) removes it: paste it again after every refresh.
+ * Pasting it again is safe: the old copy is removed first.
+ *
+ * STATUS COLORS NOT SHOWING? In the console type:  SFX.check()
+ * and send a screenshot of the result.
+ */
+
+(function shahidSalesforceHelper() {
+  'use strict';
+
+  if (window.top !== window.self) {
+    console.warn('[SF Helper] This console is set to a frame. Choose "top" in the console context menu and paste again.');
+    return;
+  }
+
+  const VERSION = '2.2.0';
+  const NS = '__SHAHID_SF_HELPER__';
+
+  // Re-injection guard: remove the previous copy before starting again.
+  if (window[NS] && typeof window[NS].destroy === 'function') {
+    try { window[NS].destroy(); } catch (e) { /* previous copy already gone */ }
+  }
+
+  /* =====================================================================
+   * 1. SETTINGS
+   * ===================================================================== */
+  const CONFIG = {
+    STATUS_STYLES: {
+      'Closed':                    { bg: '#ffcccc', border: '2px solid red' },
+      'Pending Customer Response': { bg: '#ffe0b2', border: '2px solid orange' },
+      'Resolved':                  { bg: '#c8e6c9', border: '2px solid green' },
+    },
+    // Pages where case statuses get colors: Account pages (also "View All" related lists,
+    // e.g. /lightning/r/Account/<id>/related/Cases/view) and Case list views.
+    HIGHLIGHT_PAGES: [/^\/lightning\/r\/(Account\/|001)/, /^\/lightning\/o\/Case\//, /^\/lightning\/r\/(Case\/|500)/],
+    STATUS_COLUMN_RE: /status|الحالة/i,   // table columns that hold the case status
+    COPY_ON: ['Account'],        // record pages where one click copies a field value
+    MIN_NAME_LETTERS: 4,         // a name with fewer letters is ignored
+    IGNORED_NAMES: ['guest', 'guest user'],   // these names are treated as "no name"
+    AUTO_FILL_ON_PASTE: true,    // default for the "Fill automatically when I paste" checkbox
+    CATCH_EVERGENT_IN_INPUTS: true,  // Ctrl+V of a FULL Evergent page inside a field fills the form too
+    HOTKEY_CODE: 'KeyQ',         // Alt + Q (physical key, so it also works with an Arabic keyboard)
+    SCAN_GAP_MS: 700,            // minimum time between two scans
+    HEARTBEAT_MS: 1000,          // safety re-scan (some Shadow DOM changes are not observed)
+    COPY_DELAY_MS: 280,          // wait this long so a double click does not copy
+  };
+
+  /* Salesforce fields this script fills (API names come from the page HTML). */
+  const FIELDS = {
+    cpid:        { label: 'Unique Customer ID (CPID)',     kind: 'text', input: 'Unique_Customer_ID_CSG__c' },
+    spid:        { label: 'Unique Customer ID (SP/Gigya)', kind: 'text', input: 'Unique_Customer_ID_Gigya__c' },
+    lastName:    { label: 'Last Name', item: 'Customers Name', kind: 'text', input: 'lastName' },
+    email:       { label: 'Email',             kind: 'text', input: 'PersonEmail' },
+    phone:       { label: 'Phone',             kind: 'text', input: 'Phone' },
+    whatsapp:    { label: 'Number (WhatsApp)', kind: 'text', input: 'Number_WhatsApp__c' },
+    country:     { label: 'Country',      kind: 'picklist' },
+    countryCode: { label: 'Country Code', kind: 'picklist' },
+  };
+  const FILL_ORDER = ['cpid', 'spid', 'lastName', 'email', 'phone', 'whatsapp', 'country', 'countryCode'];
+
+  /* =====================================================================
+   * 2. COUNTRY LIST
+   *    ISO code | name | phone country code | other names a picklist may use (;)
+   * ===================================================================== */
+  const COUNTRY_DATA = `
+AD|Andorra|376
+AE|United Arab Emirates|971|UAE;U.A.E.;Emirates
+AF|Afghanistan|93
+AG|Antigua and Barbuda|1
+AI|Anguilla|1
+AL|Albania|355
+AM|Armenia|374
+AO|Angola|244
+AQ|Antarctica|672
+AR|Argentina|54
+AS|American Samoa|1
+AT|Austria|43
+AU|Australia|61
+AW|Aruba|297
+AX|Åland Islands|358|Aland
+AZ|Azerbaijan|994
+BA|Bosnia and Herzegovina|387|Bosnia
+BB|Barbados|1
+BD|Bangladesh|880
+BE|Belgium|32
+BF|Burkina Faso|226
+BG|Bulgaria|359
+BH|Bahrain|973|Kingdom of Bahrain
+BI|Burundi|257
+BJ|Benin|229
+BL|Saint Barthélemy|590
+BM|Bermuda|1
+BN|Brunei|673|Brunei Darussalam
+BO|Bolivia|591|Bolivia, Plurinational State of
+BQ|Caribbean Netherlands|599|Bonaire, Sint Eustatius and Saba;Bonaire
+BR|Brazil|55
+BS|Bahamas|1|Bahamas, The
+BT|Bhutan|975
+BV|Bouvet Island|47
+BW|Botswana|267
+BY|Belarus|375
+BZ|Belize|501
+CA|Canada|1
+CC|Cocos (Keeling) Islands|61|Cocos Islands
+CD|Congo (DRC)|243|Democratic Republic of the Congo;Congo, The Democratic Republic of the;Congo, Democratic Republic of the;DR Congo;DRC;Congo-Kinshasa
+CF|Central African Republic|236
+CG|Congo|242|Republic of the Congo;Congo (Republic);Congo, Republic of the;Congo-Brazzaville
+CH|Switzerland|41
+CI|Côte d'Ivoire|225|Ivory Coast
+CK|Cook Islands|682
+CL|Chile|56
+CM|Cameroon|237
+CN|China|86
+CO|Colombia|57
+CR|Costa Rica|506
+CU|Cuba|53
+CV|Cape Verde|238|Cabo Verde
+CW|Curaçao|599
+CX|Christmas Island|61
+CY|Cyprus|357
+CZ|Czech Republic|420|Czechia
+DE|Germany|49
+DJ|Djibouti|253
+DK|Denmark|45
+DM|Dominica|1
+DO|Dominican Republic|1
+DZ|Algeria|213
+EC|Ecuador|593
+EE|Estonia|372
+EG|Egypt|20|Arab Republic of Egypt
+EH|Western Sahara|212
+ER|Eritrea|291
+ES|Spain|34
+ET|Ethiopia|251
+FI|Finland|358
+FJ|Fiji|679
+FK|Falkland Islands|500|Falkland Islands (Malvinas)
+FM|Micronesia|691|Micronesia, Federated States of
+FO|Faroe Islands|298
+FR|France|33
+GA|Gabon|241
+GB|United Kingdom|44|UK;U.K.;Great Britain;Britain;England;United Kingdom of Great Britain and Northern Ireland
+GD|Grenada|1
+GE|Georgia|995
+GF|French Guiana|594
+GG|Guernsey|44
+GH|Ghana|233
+GI|Gibraltar|350
+GL|Greenland|299
+GM|Gambia|220|Gambia, The
+GN|Guinea|224
+GP|Guadeloupe|590
+GQ|Equatorial Guinea|240
+GR|Greece|30
+GS|South Georgia and the South Sandwich Islands|500|South Georgia
+GT|Guatemala|502
+GU|Guam|1
+GW|Guinea-Bissau|245
+GY|Guyana|592
+HK|Hong Kong|852|Hong Kong SAR;Hong Kong SAR China
+HM|Heard Island and McDonald Islands|672
+HN|Honduras|504
+HR|Croatia|385
+HT|Haiti|509
+HU|Hungary|36
+ID|Indonesia|62
+IE|Ireland|353
+IL|Israel|972
+IM|Isle of Man|44
+IN|India|91
+IO|British Indian Ocean Territory|246
+IQ|Iraq|964|Republic of Iraq
+IR|Iran|98|Iran, Islamic Republic of;Islamic Republic of Iran
+IS|Iceland|354
+IT|Italy|39
+JE|Jersey|44
+JM|Jamaica|1
+JO|Jordan|962|Hashemite Kingdom of Jordan
+JP|Japan|81
+KE|Kenya|254
+KG|Kyrgyzstan|996
+KH|Cambodia|855
+KI|Kiribati|686
+KM|Comoros|269
+KN|Saint Kitts and Nevis|1
+KP|North Korea|850|Korea, Democratic People's Republic of;Democratic People's Republic of Korea;DPRK
+KR|South Korea|82|Korea, Republic of;Republic of Korea;Korea
+KW|Kuwait|965|State of Kuwait
+KY|Cayman Islands|1
+KZ|Kazakhstan|7
+LA|Laos|856|Lao People's Democratic Republic;Lao PDR
+LB|Lebanon|961
+LC|Saint Lucia|1
+LI|Liechtenstein|423
+LK|Sri Lanka|94
+LR|Liberia|231
+LS|Lesotho|266
+LT|Lithuania|370
+LU|Luxembourg|352
+LV|Latvia|371
+LY|Libya|218|Libyan Arab Jamahiriya
+MA|Morocco|212|Morroco;Marocco;Maroc
+MC|Monaco|377
+MD|Moldova|373|Moldova, Republic of;Republic of Moldova
+ME|Montenegro|382
+MF|Saint Martin|590|Saint Martin (French part)
+MG|Madagascar|261
+MH|Marshall Islands|692
+MK|North Macedonia|389|Macedonia;Macedonia, the former Yugoslav Republic of;Republic of North Macedonia
+ML|Mali|223
+MM|Myanmar|95|Burma
+MN|Mongolia|976
+MO|Macao|853|Macau;Macao SAR China
+MP|Northern Mariana Islands|1
+MQ|Martinique|596
+MR|Mauritania|222
+MS|Montserrat|1
+MT|Malta|356
+MU|Mauritius|230
+MV|Maldives|960
+MW|Malawi|265
+MX|Mexico|52
+MY|Malaysia|60
+MZ|Mozambique|258
+NA|Namibia|264
+NC|New Caledonia|687
+NE|Niger|227
+NF|Norfolk Island|672
+NG|Nigeria|234
+NI|Nicaragua|505
+NL|Netherlands|31|Holland;Netherlands, The
+NO|Norway|47
+NP|Nepal|977
+NR|Nauru|674
+NU|Niue|683
+NZ|New Zealand|64
+OM|Oman|968|Sultanate of Oman
+PA|Panama|507
+PE|Peru|51
+PF|French Polynesia|689
+PG|Papua New Guinea|675
+PH|Philippines|63
+PK|Pakistan|92
+PL|Poland|48
+PM|Saint Pierre and Miquelon|508
+PN|Pitcairn Islands|64|Pitcairn
+PR|Puerto Rico|1
+PS|Palestine|970|Palestine, State of;State of Palestine;Palestinian Territories;Palestinian Territory;Palestinian Territory, Occupied;Occupied Palestinian Territory
+PT|Portugal|351
+PW|Palau|680
+PY|Paraguay|595
+QA|Qatar|974|State of Qatar
+RE|Réunion|262
+RO|Romania|40
+RS|Serbia|381
+RU|Russia|7|Russian Federation
+RW|Rwanda|250
+SA|Saudi Arabia|966|KSA;Kingdom of Saudi Arabia
+SB|Solomon Islands|677
+SC|Seychelles|248
+SD|Sudan|249
+SE|Sweden|46
+SG|Singapore|65
+SH|Saint Helena|290|Saint Helena, Ascension and Tristan da Cunha
+SI|Slovenia|386
+SJ|Svalbard and Jan Mayen|47
+SK|Slovakia|421
+SL|Sierra Leone|232
+SM|San Marino|378
+SN|Senegal|221
+SO|Somalia|252
+SR|Suriname|597
+SS|South Sudan|211
+ST|São Tomé and Príncipe|239
+SV|El Salvador|503
+SX|Sint Maarten|1|Sint Maarten (Dutch part)
+SY|Syria|963|Syrian Arab Republic
+SZ|Eswatini|268|Swaziland
+TC|Turks and Caicos Islands|1
+TD|Chad|235
+TF|French Southern Territories|262
+TG|Togo|228
+TH|Thailand|66
+TJ|Tajikistan|992
+TK|Tokelau|690
+TL|Timor-Leste|670|East Timor
+TM|Turkmenistan|993
+TN|Tunisia|216
+TO|Tonga|676
+TR|Turkey|90|Türkiye;Turkiye
+TT|Trinidad and Tobago|1
+TV|Tuvalu|688
+TW|Taiwan|886|Taiwan, Province of China
+TZ|Tanzania|255|Tanzania, United Republic of;United Republic of Tanzania
+UA|Ukraine|380
+UG|Uganda|256
+UM|United States Minor Outlying Islands|1
+US|United States|1|USA;U.S.A.;US;United States of America
+UY|Uruguay|598
+UZ|Uzbekistan|998
+VA|Vatican City|39|Holy See;Holy See (Vatican City State);Vatican
+VC|Saint Vincent and the Grenadines|1
+VE|Venezuela|58|Venezuela, Bolivarian Republic of
+VG|British Virgin Islands|1|Virgin Islands, British
+VI|U.S. Virgin Islands|1|Virgin Islands, U.S.;US Virgin Islands
+VN|Vietnam|84|Viet Nam
+VU|Vanuatu|678
+WF|Wallis and Futuna|681
+WS|Samoa|685
+XK|Kosovo|383
+YE|Yemen|967|Republic of Yemen
+YT|Mayotte|262
+ZA|South Africa|27
+ZM|Zambia|260
+ZW|Zimbabwe|263
+`;
+
+  /** Non-standard codes some systems use. */
+  const ISO_ALIASES = { UK: 'GB', EL: 'GR' };
+
+  /** "Côte d'Ivoire" -> "cotedivoire", "St Lucia" -> "saintlucia", "The Gambia" -> "gambia". */
+  function normName(s) {
+    return String(s || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/&/g, ' and ')
+      .replace(/\bst\.?\s/g, 'saint ')
+      .replace(/^\s*the\s+/, '')
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  const COUNTRIES = COUNTRY_DATA.trim().split('\n').map((line) => {
+    const [iso, name, dial, alias = ''] = line.split('|').map((s) => s.trim());
+    return { iso, name, dial, aliases: alias ? alias.split(';').map((s) => s.trim()).filter(Boolean) : [] };
+  });
+  const BY_ISO = new Map(COUNTRIES.map((c) => [c.iso, c]));
+  const BY_NAME = new Map();
+  for (const c of COUNTRIES) {
+    for (const n of [c.name, ...c.aliases]) {
+      const k = normName(n);
+      if (k && !BY_NAME.has(k)) BY_NAME.set(k, c);
+    }
+  }
+  const DIAL_CODES = new Set(COUNTRIES.map((c) => c.dial));
+
+  function resolveCountry(value) {
+    const v = String(value || '').trim();
+    if (!v) return null;
+    if (/^[A-Za-z]{2}$/.test(v)) {
+      const up = v.toUpperCase();
+      return BY_ISO.get(ISO_ALIASES[up] || up) || null;
+    }
+    return BY_NAME.get(normName(v)) || null;
+  }
+
+  /** Phone country codes are prefix-free, so the longest matching prefix is the right one. */
+  function dialFromPhone(phone) {
+    for (let len = 3; len >= 1; len--) {
+      const p = String(phone || '').slice(0, len);
+      if (p.length === len && DIAL_CODES.has(p)) return p;
+    }
+    return null;
+  }
+
+  /* =====================================================================
+   * 3. EVERGENT PARSER
+   * ===================================================================== */
+  const LABELS = new Set([
+    'all apps / modules', 'quick links', 'account summary', 'partner', 'cp customer id', 'sp account id',
+    'service plan', 'phone number', 'email', 'country', 'account status', 'account details', 'account type',
+    'customer since', 'billing/finance', 'current balance', 'revenue till date', 'invoice no', 'invoice date',
+    'service details', 'device info', 'profiles', 'primary profile', 'payment methods', 'payment method type',
+    'details', 'threshold', 'max. devices per year',
+  ]);
+  const EMPTY_VALUES = new Set(['', '-', '--', '---', 'n/a', 'na', 'null', 'none', 'undefined', 'no data available']);
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  const STATUS_WORD_RE = /^(active|inactive|suspended|cancell?ed|closed|pending|terminated|expired|deactivated|blocked|trial|paused|churned)$/i;
+
+  const isEmptyValue = (v) => EMPTY_VALUES.has(String(v == null ? '' : v).trim().toLowerCase());
+
+  function normalizeText(raw) {
+    return String(raw || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\u00a0\u2007\u202f\u2009]/g, ' ')
+      .replace(/[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')   // invisible direction marks
+      .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x660))     // Arabic digits -> 0-9
+      .replace(/[\u06f0-\u06f9]/g, (d) => String(d.charCodeAt(0) - 0x6f0));
+  }
+
+  /** "+966 59-999 2401" / "00966599992401" -> "966599992401". Returns null if not a phone. */
+  function normalizePhone(v) {
+    if (v == null || isEmptyValue(v)) return null;
+    let s = normalizeText(v).replace(/[^\d+]/g, '');
+    s = s.replace(/^\+/, '').replace(/\+/g, '');
+    if (s.startsWith('00')) s = s.slice(2);
+    return /^\d{6,15}$/.test(s) ? s : null;
+  }
+
+  /** Same number written two ways? ("966599992401" and "0599992401") */
+  function samePhone(a, b) {
+    if (a === b) return true;
+    const x = a.replace(/^0+/, '');
+    const y = b.replace(/^0+/, '');
+    const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+    return short.length >= 8 && long.endsWith(short);
+  }
+
+  function removeCaseInsensitive(text, part) {
+    if (!part) return text;
+    const i = text.toLowerCase().indexOf(part.toLowerCase());
+    return i < 0 ? text : text.slice(0, i) + ' ' + text.slice(i + part.length);
+  }
+
+  function parseEvergent(raw) {
+    const text = normalizeText(raw);
+    const lines = text.split('\n').map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const lower = lines.map((s) => s.toLowerCase());
+    const r = {
+      cpid: null, spid: null, lastName: null, nameNote: null, email: null,
+      phone: null, whatsapp: null, phoneNote: null, whatsappNote: null, country: null, countryRaw: null,
+      countryCode: null, countryCodeNote: null, status: null, warnings: [], errors: [],
+    };
+
+    /** All values written on the line after a label ("CP Customer ID" -> next line). */
+    const valuesAfter = (label, from = 0) => {
+      const out = [];
+      for (let i = from; i < lines.length - 1; i++) {
+        if (lower[i] === label && !LABELS.has(lower[i + 1])) out.push(lines[i + 1]);
+      }
+      return out;
+    };
+    const firstValue = (label) => valuesAfter(label).find((v) => !isEmptyValue(v)) || null;
+    const profileIdx = lower.indexOf('primary profile');
+
+    // --- IDs (labels first, Evergent links as backup) ---
+    const cpids = valuesAfter('cp customer id').filter((v) => /^\d{6,25}$/.test(v));
+    const linkPairs = [...text.matchAll(/accountDetails\/(?:[A-Za-z]+\/)+(\d{6,25})\/([A-Za-z0-9-]{8,64})/g)]
+      .map((m) => ({ cpid: m[1], spid: m[2] }));
+    r.cpid = cpids[0] || (linkPairs[0] && linkPairs[0].cpid) || null;
+    const spids = valuesAfter('sp account id').filter((v) => /^[A-Za-z0-9-]{8,64}$/.test(v));
+    const linkSp = linkPairs.find((p) => p.cpid === r.cpid);
+    r.spid = spids[0] || (linkSp && linkSp.spid) || null;
+    const distinct = new Set([...cpids, ...linkPairs.map((p) => p.cpid)]);
+    if (distinct.size > 1) r.warnings.push(`The paste has ${distinct.size} different accounts. Used CPID ${r.cpid}.`);
+
+    r.status = firstValue('account status');
+
+    // --- Email ---
+    const emailValue = firstValue('email');
+    if (emailValue && EMAIL_RE.test(emailValue)) r.email = emailValue;
+
+    const summaryIdx = lower.indexOf('account summary');
+    let summaryLine = '';
+    if (summaryIdx >= 0 && summaryIdx + 1 < lines.length && !LABELS.has(lower[summaryIdx + 1])) {
+      summaryLine = lines[summaryIdx + 1].replace(/^[*•\-–]\s*/, '');
+    }
+    if (!r.email) {
+      const tokens = [...summaryLine.split(' ')];
+      if (profileIdx >= 0) for (let i = profileIdx + 1; i < Math.min(lines.length, profileIdx + 4); i++) tokens.push(lines[i]);
+      r.email = tokens.find((t) => EMAIL_RE.test(t)) || null;
+    }
+
+    // --- Phones ---
+    const phoneNumber = normalizePhone(firstValue('phone number'));
+    let cellPhone = null;
+    const cellRe = /^cell\s*phone\s*:?\s*/i;
+    let cellIdx = lines.findIndex((l, i) => i > profileIdx && cellRe.test(l));
+    if (cellIdx < 0) cellIdx = lines.findIndex((l) => cellRe.test(l));
+    if (cellIdx >= 0) {
+      let rest = lines[cellIdx].replace(cellRe, '');
+      if (!rest && cellIdx + 1 < lines.length) rest = lines[cellIdx + 1];
+      rest = removeCaseInsensitive(rest, r.email);           // Evergent glues the email to the number
+      rest = rest.replace(/--+\s*$/, '').trim();
+      const lead = rest.match(/^\+?[\d\s\-().]+/);
+      const digits = lead ? lead[0].replace(/\D/g, '') : '';
+      if (phoneNumber && digits.length > phoneNumber.length && digits.startsWith(phoneNumber)) {
+        cellPhone = phoneNumber;                              // email digits stuck to the number
+      } else if (digits.length > 15) {
+        r.warnings.push('The "Cell Phone" number is not clear in the paste. It was not used.');
+      } else {
+        cellPhone = normalizePhone(lead ? lead[0] : '');
+      }
+    }
+    if (phoneNumber && cellPhone && !samePhone(phoneNumber, cellPhone)) {
+      r.phone = phoneNumber;
+      r.whatsapp = cellPhone;
+      r.phoneNote = 'Phone Number and Cell Phone are different';
+    } else {
+      r.phone = phoneNumber || cellPhone || null;
+      if (!phoneNumber && cellPhone) r.phoneNote = 'taken from Cell Phone';
+      if (phoneNumber && cellPhone) r.whatsappNote = 'same as Phone, not changed';
+    }
+
+    // --- Name -> Last Name ---
+    const cleanName = (s) => {
+      let n = String(s || '');
+      if (r.email) n = removeCaseInsensitive(n, r.email);
+      n = n.replace(/\S+@\S+\.\S+/g, ' ');
+      n = n.replace(/(^|\s)--+(?=\s|$)/g, ' ');
+      n = n.replace(/\s+[-–—]+\s+/g, ' ').replace(/^\s*[-–—*•]+\s*/, '').replace(/\s*[-–—]+\s*$/, '');
+      return n.replace(/\s+/g, ' ').trim();
+    };
+    const fromSummary = () => {
+      let s = summaryLine;
+      if (r.email) s = removeCaseInsensitive(s, r.email);
+      s = s.replace(/(^|\s)--+(?=\s|$)/g, ' ').replace(/\s+/g, ' ').trim();
+      const tokens = s.split(' ');
+      const last = tokens[tokens.length - 1] || '';
+      if ((r.status && last.toLowerCase() === r.status.toLowerCase()) || STATUS_WORD_RE.test(last)) tokens.pop();
+      return cleanName(tokens.join(' '));
+    };
+    const fromProfile = () => {
+      if (profileIdx < 0 || profileIdx + 1 >= lines.length) return '';
+      const cand = lines[profileIdx + 1];
+      if (cellRe.test(cand) || EMAIL_RE.test(cand) || LABELS.has(lower[profileIdx + 1])) return '';
+      return cleanName(cand);
+    };
+    const nameProblem = (n) => {
+      if (!n) return 'no name in Evergent';
+      if (/[?\uFFFD]/.test(n)) return `name is not readable ("${n}")`;
+      if (n.includes('@')) return 'name is an email';
+      const words = n.toLowerCase().replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+      if (CONFIG.IGNORED_NAMES.includes(words)) return `name is "${n}"`;
+      const letters = (n.match(/\p{L}/gu) || []).length;
+      if (letters < CONFIG.MIN_NAME_LETTERS) return `"${n}" has less than ${CONFIG.MIN_NAME_LETTERS} letters`;
+      return null;
+    };
+    const candidates = [fromProfile(), fromSummary()];
+    const good = candidates.find((n) => n && !nameProblem(n));
+    if (good) r.lastName = good.slice(0, 80);
+    else r.nameNote = 'ignored: ' + nameProblem(candidates.find(Boolean) || '');
+
+    // --- Country + Country Code ---
+    r.countryRaw = firstValue('country');
+    if (r.countryRaw) {
+      r.country = resolveCountry(r.countryRaw);
+      if (!r.country) r.warnings.push(`Unknown country "${r.countryRaw}". Choose Country and Country Code by hand.`);
+    }
+    if (r.country) {
+      r.countryCode = r.country.dial;
+    } else if (r.phone) {
+      r.countryCode = dialFromPhone(r.phone);
+      if (r.countryCode) r.countryCodeNote = 'guessed from the phone number';
+    }
+
+    // --- Sanity check ---
+    if (!r.cpid && !r.spid && !r.email && !r.phone && !r.country) {
+      r.errors.push(/no account found/i.test(text)
+        ? 'Evergent says "No account found". Nothing to fill.'
+        : 'This does not look like an Evergent account page. Copy the page with Ctrl+A, Ctrl+C.');
+    }
+    return r;
+  }
+
+  /* =====================================================================
+   * 4. DOM HELPERS (work with Salesforce Shadow DOM, synthetic or native)
+   * ===================================================================== */
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const attrEq = (v) => '"' + String(v).replace(/["\\]/g, '\\$&') + '"';
+
+  /** document + every shadow root under `start`. */
+  function collectRoots(start = document) {
+    const roots = [];
+    const seen = new Set();
+    const stack = [start];
+    if (start && start.shadowRoot) stack.push(start.shadowRoot);
+    while (stack.length) {
+      const root = stack.pop();
+      if (!root || seen.has(root) || !root.querySelectorAll) continue;
+      seen.add(root);
+      roots.push(root);
+      const all = root.querySelectorAll('*');
+      for (let i = 0; i < all.length; i++) {
+        const sr = all[i].shadowRoot;
+        if (sr && !seen.has(sr)) stack.push(sr);
+      }
+    }
+    return roots;
+  }
+
+  /** querySelectorAll that also looks inside shadow roots. Use simple selectors only. */
+  function deepQueryAll(selector, start = document) {
+    const out = new Set();
+    for (const root of collectRoots(start)) {
+      const found = root.querySelectorAll(selector);
+      for (let i = 0; i < found.length; i++) out.add(found[i]);
+    }
+    return [...out];
+  }
+
+  function parentAcross(n) {
+    if (!n) return null;
+    if (n.parentElement) return n.parentElement;
+    if (n.parentNode && n.parentNode.host) return n.parentNode.host;
+    const root = n.getRootNode ? n.getRootNode() : null;
+    return root && root !== n && root.host ? root.host : null;
+  }
+
+  function closestDeep(el, selector) {
+    for (let n = el; n; n = parentAcross(n)) {
+      if (n.nodeType === 1 && n.matches(selector)) return n;
+    }
+    return null;
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    return getComputedStyle(el).visibility !== 'hidden';
+  }
+
+  const DIALOG_SEL = 'section[role="dialog"], [role="dialog"], .slds-modal, .uiModal';
+  /** Several matches (cached hidden tabs, modal over a page)? Take the visible one, a modal first. */
+  function pickBest(els) {
+    const visible = els.filter(isVisible);
+    return visible.find((e) => closestDeep(e, DIALOG_SEL)) || visible[0] || null;
+  }
+
+  /**
+   * Text of an element as the user sees it, without screen-reader-only text.
+   * Salesforce can hide component parts from normal DOM reading, so the text is read
+   * two ways (through shadow roots, and as the browser draws the page) and the
+   * fuller result wins.
+   */
+  function deepText(node) {
+    const a = composedText(node);
+    const b = physicalText(node);
+    return b.length > a.length ? b : a;
+  }
+
+  const SKIP_TAGS = new Set(['style', 'script', 'template', 'svg', 'button']);
+
+  /** Text as the browser draws it. Works even when Salesforce hides component parts. */
+  function physicalText(node) {
+    const parts = [];
+    let walker;
+    try {
+      walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          if (n.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
+          if (n !== node && (SKIP_TAGS.has(n.localName) || n.classList.contains('slds-assistive-text'))) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_SKIP;
+        },
+      });
+    } catch (e) { return ''; }
+    while (walker.nextNode()) parts.push(walker.currentNode.nodeValue);
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  /** Every element once: the page as drawn, plus open shadow roots. */
+  function walkElements(visit, start) {
+    const stack = [start || document.body || document.documentElement];
+    const seen = new Set();
+    while (stack.length) {
+      const root = stack.pop();
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      let walker;
+      try { walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT); } catch (e) { continue; }
+      for (let el = walker.currentNode; el; el = walker.nextNode()) {
+        if (el.nodeType !== 1) continue;
+        visit(el);
+        const sr = el.shadowRoot;
+        if (sr && !seen.has(sr)) stack.push(sr);
+      }
+    }
+  }
+
+  /** Text through shadow roots and slots. */
+  function composedText(node) {
+    const parts = [];
+    const visit = (n) => {
+      if (n.nodeType === 3) { parts.push(n.nodeValue); return; }
+      if (n.nodeType !== 1 && n.nodeType !== 11) return;
+      if (n.nodeType === 1) {
+        const tag = n.localName;
+        if (tag === 'style' || tag === 'script' || tag === 'template' || tag === 'svg') return;
+        if (n.classList.contains('slds-assistive-text')) return;
+        if (tag === 'button' && n !== node) return;      // edit/preview buttons are not part of the value
+        if (tag === 'slot') {
+          const assigned = typeof n.assignedNodes === 'function' ? n.assignedNodes() : [];
+          (assigned.length ? assigned : [...n.childNodes]).forEach(visit);
+          return;
+        }
+        if (n.shadowRoot) { [...n.shadowRoot.childNodes].forEach(visit); return; }
+      }
+      [...n.childNodes].forEach(visit);
+    };
+    visit(node);
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  async function waitFor(fn, timeout = 4000, every = 100) {
+    const end = Date.now() + timeout;
+    for (;;) {
+      let v = null;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return v;
+      if (Date.now() > end) return null;
+      await sleep(every);
+    }
+  }
+
+  function fireClick(el) {
+    const opts = { bubbles: true, composed: true, cancelable: true, view: window, button: 0 };
+    const P = window.PointerEvent || MouseEvent;
+    el.dispatchEvent(new P('pointerdown', opts));
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new P('pointerup', opts));
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.dispatchEvent(new MouseEvent('click', opts));
+  }
+
+  function routeInfo() {
+    const p = location.pathname;
+    const rec = p.match(/^\/lightning\/r\/(?:([A-Za-z0-9_]+)\/)?([A-Za-z0-9]{15,18})\/(view|edit)/);
+    if (rec) return { object: rec[1] || (rec[2].startsWith('001') ? 'Account' : null), recordId: rec[2], mode: rec[3] };
+    const nw = p.match(/^\/lightning\/o\/([A-Za-z0-9_]+)\/new/);
+    if (nw) return { object: nw[1], recordId: null, mode: 'new' };
+    return { object: null, recordId: null, mode: null };
+  }
+  const onRecordOf = (objects) => { const r = routeInfo(); return !!r.recordId && objects.includes(r.object); };
+  const onAccountForm = () => routeInfo().object === 'Account';
+
+  /** Changes when the user opens another profile or a new "New Account" form. */
+  function routeKey() {
+    const r = routeInfo();
+    if (r.recordId) return 'rec:' + r.recordId.slice(0, 15);
+    if (r.mode === 'new') return 'new:' + r.object + ':' + (new URLSearchParams(location.search).get('uid') || '');
+    return 'path:' + location.pathname;
+  }
+
+  /* =====================================================================
+   * 5. SALESFORCE FORM FILLING
+   * ===================================================================== */
+  function findLayoutItems(label) {
+    return deepQueryAll(`records-record-layout-item[field-label=${attrEq(label)}]`).filter(isVisible);
+  }
+
+  function findTextInput(field) {
+    let el = pickBest(deepQueryAll(`input[name=${attrEq(field.input)}]`));
+    if (el) return el;
+    for (const item of findLayoutItems(field.item || field.label)) {
+      const inputs = deepQueryAll('input', item).filter((i) => isVisible(i) && i.type !== 'checkbox' && i.type !== 'hidden');
+      el = field.input === 'lastName'
+        ? inputs.find((i) => i.name === 'lastName' || /last name/i.test(i.placeholder || ''))
+        : (inputs.length === 1 ? inputs[0] : null);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  function findCombobox(field) {
+    for (const item of findLayoutItems(field.label)) {
+      const btn = pickBest(deepQueryAll('button[role="combobox"], input[role="combobox"]', item));
+      if (btn) return btn;
+    }
+    return pickBest(deepQueryAll(`button[role="combobox"][aria-label=${attrEq(field.label)}]`));
+  }
+
+  function setNativeValue(input, value) {
+    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    input.focus({ preventScroll: true });
+    setter.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    input.blur();
+  }
+
+  async function fillText(field, value) {
+    const input = findTextInput(field);
+    if (!input) return { status: 'error', msg: 'field not found on this page' };
+    let v = String(value);
+    let msg = '';
+    if (input.maxLength > 0 && v.length > input.maxLength) { v = v.slice(0, input.maxLength); msg = 'cut to ' + input.maxLength + ' characters'; }
+    if (input.value === v) return { status: 'same', el: input };
+    setNativeValue(input, v);
+    await sleep(60);
+    const now = findTextInput(field) || input;
+    if (now.value !== v) return { status: 'error', msg: 'Salesforce did not keep the value', el: input };
+    return { status: 'ok', el: input, msg };
+  }
+
+  /** Options of an open picklist (they live next to the button, or in a popup). */
+  function findOptions(btn) {
+    const sel = 'lightning-base-combobox-item, [role="option"]';
+    const valid = (o) => isVisible(o) && !o.closest('.sfx-ui');
+    let opts = deepQueryAll(sel, btn.getRootNode()).filter(valid);
+    if (!opts.length) {
+      const listId = btn.getAttribute('aria-controls');
+      opts = deepQueryAll(sel).filter(valid).filter((o) => {
+        const lb = closestDeep(o, '[role="listbox"]');
+        return !listId || !lb || lb.id === listId;
+      });
+    }
+    return opts;
+  }
+
+  function optionInfo(o) {
+    const value = o.getAttribute('data-value') || '';
+    const label = deepText(o) || o.getAttribute('aria-label') || o.getAttribute('title') || value;
+    return { value, label };
+  }
+
+  function closeDropdown(btn) {
+    if (btn && btn.isConnected && btn.getAttribute('aria-expanded') === 'true') {
+      btn.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, composed: true }));
+      if (btn.getAttribute('aria-expanded') === 'true') btn.click();
+    }
+  }
+
+  async function fillPicklist(field, wanted) {
+    const btn = await waitFor(() => findCombobox(field), 1500);
+    if (!btn) return { status: 'error', msg: 'field not found on this page' };
+    const unlocked = await waitFor(() => btn.getAttribute('aria-disabled') !== 'true' && !btn.disabled, 2500);
+    if (!unlocked) return { status: 'error', msg: 'field is locked', el: btn };
+
+    const current = { value: btn.getAttribute('data-value') || '', label: deepText(btn) };
+    if (wanted.score(current.value, current.label) > 0) return { status: 'same', el: btn };
+
+    if (btn.getAttribute('aria-expanded') !== 'true') { btn.focus({ preventScroll: true }); btn.click(); }
+    const opts = await waitFor(() => { const o = findOptions(btn); return o.length ? o : null; }, 4000);
+    if (!opts) { closeDropdown(btn); return { status: 'error', msg: 'the list did not open', el: btn }; }
+
+    let best = null;
+    let bestScore = 0;
+    for (const o of opts) {
+      const info = optionInfo(o);
+      if (!info.value || /^-+\s*none\s*-+$/i.test(info.value)) continue;
+      const s = wanted.score(info.value, info.label);
+      if (s > bestScore) { best = o; bestScore = s; }
+    }
+    if (!best) { closeDropdown(btn); return { status: 'error', msg: `"${wanted.display}" is not in the list. Choose it by hand.`, el: btn }; }
+
+    const target = optionInfo(best).value;
+    if (best.scrollIntoView) best.scrollIntoView({ block: 'nearest' });
+    fireClick(best);
+    const done = await waitFor(() => {
+      const b = btn.isConnected ? btn : findCombobox(field);
+      return b && b.getAttribute('data-value') === target;
+    }, 2500);
+    if (!done) { closeDropdown(btn); return { status: 'error', msg: 'could not select it. Choose it by hand.', el: btn }; }
+    return { status: 'ok', el: btn };
+  }
+
+  function countryWanted(c) {
+    const names = new Set([c.name, ...c.aliases].map(normName));
+    return {
+      display: c.name,
+      score: (value, label) => {
+        if (value && value.toUpperCase() === c.iso) return 3;          // picklist stores ISO codes
+        if (names.has(normName(value)) || names.has(normName(label))) return 2;
+        return 0;
+      },
+    };
+  }
+
+  function dialWanted(dial, c) {
+    const names = c ? new Set([c.name, ...c.aliases].map(normName)) : new Set();
+    const digits = (s) => String(s || '').replace(/\D/g, '');
+    return {
+      display: dial,
+      score: (value, label) => {
+        const dv = digits(value);
+        const dl = digits(label);
+        if (dv !== dial && !(dv === '' && dl === dial)) return dl === dial ? 1 : 0;
+        // Shared codes (+1, +7, +44...): prefer the option that names this country.
+        return names.has(normName(label).replace(/\d+/g, '')) ? 3 : 2;
+      },
+    };
+  }
+
+  function findEditTrigger() {
+    const all = deepQueryAll('button.inline-edit-trigger, button.test-id__inline-edit-trigger')
+      .filter((b) => isVisible(closestDeep(b, 'records-record-layout-item') || b));
+    return all.find((b) => (b.title || '').includes('Unique Customer ID (CPID)')) || all[0] || null;
+  }
+
+  async function ensureEditMode() {
+    const ready = () => findTextInput(FIELDS.cpid) || findTextInput(FIELDS.lastName) || findCombobox(FIELDS.country);
+    if (ready()) return;
+    if (!onAccountForm()) throw new Error('Open an Account page (or New Account) first.');
+    let trigger = findEditTrigger();
+    if (!trigger) {
+      const tab = pickBest(deepQueryAll('a[data-tab-value="detailTab"]'));
+      if (tab) { tab.click(); trigger = await waitFor(findEditTrigger, 4000); }
+    }
+    if (!trigger) throw new Error('Could not find the edit (pencil) button. Open the Details tab.');
+    trigger.click();
+    if (!(await waitFor(ready, 8000))) throw new Error('Edit mode did not open. Try again.');
+    await sleep(250);
+  }
+
+  function flash(el, ok) {
+    const box = closestDeep(el, 'records-record-layout-item') || el;
+    if (!box || !box.style) return;
+    const prev = [box.style.outline, box.style.outlineOffset];
+    box.style.outline = `2px solid ${ok ? '#2e844a' : '#ea001e'}`;
+    box.style.outlineOffset = '2px';
+    setTimeout(() => { box.style.outline = prev[0]; box.style.outlineOffset = prev[1]; }, ok ? 3000 : 6000);
+  }
+
+  let busy = false;
+  async function fillSalesforce(data) {
+    if (busy) return { error: 'Already filling, please wait.' };
+    busy = true;
+    const results = {};
+    try {
+      await ensureEditMode();
+      const values = {
+        cpid: data.cpid, spid: data.spid, lastName: data.lastName, email: data.email,
+        phone: data.phone, whatsapp: data.whatsapp,
+      };
+      for (const key of FILL_ORDER) {
+        const field = FIELDS[key];
+        let res;
+        if (field.kind === 'text') {
+          res = values[key] ? await fillText(field, values[key]) : { status: 'skip' };
+        } else if (key === 'country') {
+          res = data.country ? await fillPicklist(field, countryWanted(data.country)) : { status: 'skip' };
+        } else {
+          res = data.countryCode ? await fillPicklist(field, dialWanted(data.countryCode, data.country)) : { status: 'skip' };
+        }
+        results[key] = res;
+        if (res.el && (res.status === 'ok' || res.status === 'error')) flash(res.el, res.status === 'ok');
+        if (key === 'country' && res.status === 'ok') await sleep(400);   // Country Code may depend on Country
+        else await sleep(80);
+      }
+      return { results };
+    } catch (e) {
+      return { results, error: e.message || String(e) };
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* =====================================================================
+   * 6. UI (floating button + panel + toast). Built with DOM APIs, no innerHTML.
+   * ===================================================================== */
+  const CSS = `
+.sfx-ui, .sfx-ui * { box-sizing: border-box; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+.sfx-fab { position: fixed; right: 20px; bottom: 56px; z-index: 2147483000; width: 44px; height: 44px; padding: 0;
+  border: 0; border-radius: 50%; background: #0176d3; color: #fff; font-size: 13px; font-weight: 700; cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+.sfx-fab:hover { background: #014486; }
+.sfx-panel { position: fixed; right: 20px; bottom: 108px; z-index: 2147483000; width: 410px; max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 140px); overflow: auto; background: #fff; color: #181818; border: 1px solid #c9c9c9;
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.25); font-size: 13px; line-height: 1.4; }
+.sfx-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: #f3f3f3; border-bottom: 1px solid #e5e5e5;
+  border-radius: 8px 8px 0 0; font-weight: 700; }
+.sfx-head span { flex: 1; }
+.sfx-head small { font-weight: 400; color: #747474; }
+.sfx-x { border: 0; background: transparent; font-size: 18px; line-height: 1; cursor: pointer; color: #444; padding: 2px 6px; }
+.sfx-body { padding: 10px 12px 12px; }
+.sfx-ta { width: 100%; height: 70px; resize: vertical; padding: 6px 8px; border: 1px solid #c9c9c9; border-radius: 4px;
+  font-size: 12px; color: #181818; background: #fff; }
+.sfx-ta:focus { outline: 2px solid #0176d3; border-color: #0176d3; }
+.sfx-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.sfx-btn { border: 1px solid #c9c9c9; background: #fff; color: #0176d3; border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+.sfx-btn:hover { background: #f3f3f3; }
+.sfx-btn.sfx-primary { background: #0176d3; border-color: #0176d3; color: #fff; }
+.sfx-btn.sfx-primary:hover { background: #014486; }
+.sfx-btn:disabled { opacity: .5; cursor: default; }
+.sfx-check { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: #444; cursor: pointer; }
+.sfx-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+.sfx-table td { border-top: 1px solid #eee; padding: 4px 4px; vertical-align: top; }
+.sfx-table td:first-child { color: #555; white-space: nowrap; width: 1%; }
+.sfx-table td.sfx-val { font-weight: 600; word-break: break-all; }
+.sfx-table td.sfx-res { font-size: 11px; color: #555; }
+.sfx-ok { color: #2e844a !important; } .sfx-warn { color: #a96404 !important; } .sfx-err { color: #ea001e !important; } .sfx-dim { color: #888 !important; }
+.sfx-msg { margin-top: 8px; padding: 6px 8px; border-radius: 4px; font-size: 12px; }
+.sfx-msg.sfx-info { background: #eef4ff; color: #014486; }
+.sfx-msg.sfx-bad { background: #fde8e8; color: #8e030f; }
+.sfx-msg.sfx-mid { background: #fef1e0; color: #8c4b02; }
+.sfx-toast { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); z-index: 2147483001; max-width: 70vw;
+  padding: 8px 14px; border-radius: 6px; background: #032d60; color: #fff; font-size: 13px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; opacity: 0; transition: opacity .15s; pointer-events: none; }
+.sfx-toast.sfx-show { opacity: 1; }
+html.sfx-copy-on .test-id__field-value.slds-form-element__static { cursor: copy; }
+`;
+
+  function h(tag, attrs, ...children) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+      else if (k in el && typeof v !== 'string') el[k] = v;
+      else el.setAttribute(k, v === true ? '' : v);
+    }
+    for (const c of children.flat()) if (c != null) el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    return el;
+  }
+
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('sfx.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem('sfx.' + k, JSON.stringify(v)); } catch (e) { /* storage blocked */ } },
+  };
+
+  const ui = {};
+
+  function buildUI() {
+    ui.style = h('style', { id: 'sfx-style', text: CSS });
+    document.head.appendChild(ui.style);
+
+    ui.fab = h('button', { class: 'sfx-ui sfx-fab', type: 'button', title: 'Evergent → Salesforce (Alt+Q)', text: 'EV', onclick: () => togglePanel() });
+    ui.ta = h('textarea', {
+      class: 'sfx-ta', spellcheck: 'false', dir: 'auto',
+      placeholder: 'Paste the Evergent page here (Ctrl+V)',
+      onpaste: onPaste,
+      oninput: () => { if (!ui.ta.value.trim()) clearAll(); },
+    });
+    ui.auto = h('input', { type: 'checkbox', checked: store.get('autoFill', CONFIG.AUTO_FILL_ON_PASTE), onchange: () => store.set('autoFill', ui.auto.checked) });
+    ui.btnClip = h('button', { class: 'sfx-btn sfx-primary', type: 'button', text: 'Paste & Fill', title: 'Read the clipboard and fill', onclick: pasteFromClipboard });
+    ui.btnFill = h('button', { class: 'sfx-btn', type: 'button', text: 'Fill', title: 'Fill again with the text in the box', onclick: () => runFill(ui.ta.value) });
+    ui.btnClear = h('button', { class: 'sfx-btn', type: 'button', text: 'Clear', onclick: () => { ui.ta.value = ''; clearAll(); ui.ta.focus(); } });
+    ui.table = h('table', { class: 'sfx-table' });
+    ui.msg = h('div');
+    ui.panel = h('div', { class: 'sfx-ui sfx-panel', role: 'dialog', 'aria-label': 'Evergent to Salesforce', hidden: true },
+      h('div', { class: 'sfx-head' },
+        h('span', null, 'Evergent → Salesforce ', h('small', { text: 'v' + VERSION })),
+        h('button', { class: 'sfx-x', type: 'button', title: 'Close (Esc)', text: '×', onclick: () => togglePanel(false) })),
+      h('div', { class: 'sfx-body' },
+        ui.ta,
+        h('div', { class: 'sfx-row' }, ui.btnClip, ui.btnFill, ui.btnClear),
+        h('label', { class: 'sfx-check' }, ui.auto, 'Fill automatically when I paste'),
+        ui.table,
+        ui.msg));
+    ui.panel.addEventListener('keydown', (e) => { if (e.key === 'Escape') togglePanel(false); });
+    ui.toast = h('div', { class: 'sfx-ui sfx-toast', role: 'status' });
+    document.body.append(ui.fab, ui.panel, ui.toast);
+  }
+
+  function togglePanel(force) {
+    const show = typeof force === 'boolean' ? force : ui.panel.hidden;
+    if (show) checkRoute();
+    ui.panel.hidden = !show;
+    if (show) setTimeout(() => ui.ta.focus(), 0);
+  }
+
+  /** New profile / other profile opened: forget the previous paste. */
+  let lastRouteKey = null;
+  function checkRoute() {
+    const key = routeKey();
+    if (key === lastRouteKey) return;
+    const first = lastRouteKey === null;
+    lastRouteKey = key;
+    if (!first && !busy) { ui.ta.value = ''; clearAll(); }
+  }
+
+  let toastTimer = null;
+  function toast(text, ms = 1800) {
+    ui.toast.textContent = text;
+    ui.toast.classList.add('sfx-show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => ui.toast.classList.remove('sfx-show'), ms);
+  }
+
+  function setMessage(text, kind = 'info') {
+    ui.msg.replaceChildren();
+    if (text) ui.msg.append(h('div', { class: 'sfx-msg sfx-' + kind, text }));
+  }
+  function addMessage(text, kind = 'info') { ui.msg.append(h('div', { class: 'sfx-msg sfx-' + kind, text })); }
+
+  function clearAll() { ui.table.replaceChildren(); setMessage(''); }
+
+  const RESULT_TEXT = {
+    ok: ['✓ filled', 'sfx-ok'], same: ['✓ already correct', 'sfx-ok'], skip: ['— not in Evergent', 'sfx-dim'], error: ['✗ ', 'sfx-err'],
+  };
+
+  function renderTable(d, results) {
+    const rows = [
+      ['cpid', 'CPID', d.cpid],
+      ['spid', 'SP/Gigya ID', d.spid],
+      ['lastName', 'Last Name', d.lastName, d.nameNote],
+      ['email', 'Email', d.email],
+      ['phone', 'Phone', d.phone, d.phoneNote],
+      ['whatsapp', 'WhatsApp', d.whatsapp, d.whatsappNote],
+      ['country', 'Country', d.country ? `${d.country.name} (${d.country.iso})` : d.countryRaw, d.country ? null : (d.countryRaw ? 'unknown country code' : null)],
+      ['countryCode', 'Country Code', d.countryCode, d.countryCodeNote],
+    ];
+    ui.table.replaceChildren(...rows.map(([key, label, value, note]) => {
+      const res = results && results[key];
+      const noteCls = /^(ignored|unknown)/.test(note || '') ? 'sfx-warn' : 'sfx-dim';
+      let text = note || (value ? 'ready' : '—');
+      let cls = noteCls;
+      if (res) {
+        const [t, c] = RESULT_TEXT[res.status] || ['', ''];
+        text = res.status === 'error' ? t + res.msg : (res.status === 'skip' && note ? note : t + (res.msg ? ' (' + res.msg + ')' : ''));
+        cls = res.status === 'skip' && note ? noteCls : c;
+      }
+      return h('tr', null,
+        h('td', { text: label }),
+        h('td', { class: 'sfx-val', dir: 'auto', text: value || '—' }),
+        h('td', { class: 'sfx-res ' + cls, text }));
+    }));
+  }
+
+  function showParsed(d) {
+    renderTable(d);
+    setMessage('');
+    d.errors.forEach((m) => addMessage(m, 'bad'));
+    d.warnings.forEach((m) => addMessage(m, 'mid'));
+  }
+
+  /** fromPage = Ctrl+V on the page: the panel stays closed unless something needs attention. */
+  async function runFill(text, fromPage = false) {
+    if (!String(text || '').trim()) { setMessage('Paste the Evergent page first.', 'mid'); return; }
+    if (busy) { toast('Still filling, please wait…'); return; }
+    const d = parseEvergent(text);
+    showParsed(d);
+    if (d.errors.length) { if (fromPage) toast(d.errors[0], 3500); return; }
+    if (!onAccountForm()) { addMessage('Open an Account page (or New Account) to fill it.', 'mid'); return; }
+    [ui.btnClip, ui.btnFill].forEach((b) => { b.disabled = true; });
+    addMessage('Filling…', 'info');
+    if (fromPage) toast('Filling from Evergent…', 10000);
+    const out = await fillSalesforce(d);
+    [ui.btnClip, ui.btnFill].forEach((b) => { b.disabled = false; });
+    renderTable(d, out.results);
+    setMessage('');
+    if (out.error) addMessage(out.error, 'bad');
+    d.warnings.forEach((m) => addMessage(m, 'mid'));
+    const failed = Object.values(out.results || {}).filter((r) => r.status === 'error').length;
+    if (!out.error) {
+      addMessage(failed ? `Done with ${failed} problem(s) (red). Fix them, check the values, then click Save.`
+        : 'Done. Check the values, then click Save.', failed ? 'mid' : 'info');
+      toast(failed ? 'Filled with problems — see the panel' : 'Filled — check and click Save', 2500);
+    } else {
+      toast(out.error, 3500);
+    }
+    if (fromPage && (failed || out.error)) togglePanel(true);
+  }
+
+  /** Clipboard HTML may hold the Evergent links even when the plain text does not. */
+  function linksFromHtml(html) {
+    if (!html) return '';
+    return [...html.matchAll(/href=["']([^"']*accountDetails[^"']*)["']/gi)].map((m) => m[1]).join('\n');
+  }
+
+  function onPaste(e) {
+    const cd = e.clipboardData;
+    if (!cd) { setTimeout(() => afterPaste(ui.ta.value), 0); return; }
+    e.preventDefault();
+    const text = cd.getData('text/plain') || '';
+    const links = linksFromHtml(cd.getData('text/html'));
+    ui.ta.value = links ? text + '\n' + links : text;
+    afterPaste(ui.ta.value);
+  }
+
+  function afterPaste(text) {
+    if (ui.auto.checked) { runFill(text); return; }
+    const d = parseEvergent(text);
+    showParsed(d);
+    if (!d.errors.length) addMessage('Click "Fill" to put these values in the form.', 'info');
+  }
+
+  async function pasteFromClipboard() {
+    togglePanel(true);
+    let text = '';
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      setMessage('The browser blocked clipboard reading. Click in the box and press Ctrl+V.', 'mid');
+      ui.ta.focus();
+      return;
+    }
+    ui.ta.value = text;
+    runFill(text);
+  }
+
+  /* ---------- Ctrl+V anywhere on the page ---------- */
+  const NON_TEXT_INPUT = /^(button|checkbox|radio|submit|reset|image|file|color|range|hidden)$/i;
+  function isEditable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.isContentEditable) return true;
+    if (el.localName === 'textarea') return !el.readOnly && !el.disabled;
+    if (el.localName === 'input') return !NON_TEXT_INPUT.test(el.type || 'text') && !el.readOnly && !el.disabled;
+    const role = el.getAttribute('role');
+    return role === 'textbox' || role === 'searchbox';
+  }
+
+  function deepActiveElement() {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return a;
+  }
+
+  /** A full Evergent page (never something you want inside one field). */
+  function isFullEvergentPage(text) {
+    const lines = normalizeText(text).split('\n').map((l) => l.trim().toLowerCase());
+    return lines.includes('cp customer id') && lines.includes('sp account id');
+  }
+
+  function onDocPaste(e) {
+    if (!onAccountForm()) return;
+    const path = e.composedPath ? e.composedPath() : [];
+    if (path.some((n) => n && n.nodeType === 1 && n.classList.contains('sfx-ui'))) return;   // our own box
+    const cd = e.clipboardData;
+    const plain = cd ? cd.getData('text/plain') || '' : '';
+    if (!plain.trim()) return;                                        // image or nothing: not ours
+
+    const inField = [path[0], e.target, deepActiveElement()].some(isEditable);
+    if (inField && !(CONFIG.CATCH_EVERGENT_IN_INPUTS && isFullEvergentPage(plain))) return;   // normal paste
+
+    checkRoute();
+    const links = linksFromHtml(cd.getData('text/html'));
+    const text = links ? plain + '\n' + links : plain;
+    if (parseEvergent(text).errors.length) {
+      if (!inField) toast('Not an Evergent account page — nothing filled', 2500);
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (inField && document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    ui.ta.value = text;
+    if (ui.auto.checked) runFill(text, true);
+    else { togglePanel(true); afterPaste(text); }
+  }
+
+  /* =====================================================================
+   * 7. ONE-CLICK COPY (double click still opens edit mode)
+   * ===================================================================== */
+  let copyTimer = null;
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      const active = document.activeElement;
+      const ta = h('textarea', { class: 'sfx-ui' });
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      ta.remove();
+      if (active && active.focus) active.focus({ preventScroll: true });
+      return ok;
+    }
+  }
+
+  const pointIn = (el, x, y) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+
+  /** Backup when the browser hides the inner click target: find the field under the mouse. */
+  function valueAtPoint(x, y) {
+    const sel = 'span.test-id__field-value.slds-form-element__static';
+    let hit = deepQueryAll(sel).find((s) => pointIn(s, x, y)) || null;
+    if (!hit) walkElements((el) => { if (!hit && el.matches(sel) && pointIn(el, x, y)) hit = el; });
+    return hit;
+  }
+
+  function onDocClick(e) {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    if (!onRecordOf(CONFIG.COPY_ON)) return;
+    let valueEl = null;
+    let link = null;
+    let insideLayout = false;
+    for (const n of e.composedPath()) {
+      if (!n || n.nodeType !== 1) continue;
+      if (n.classList.contains('sfx-ui')) return;
+      if (n.matches('button, input, textarea, select, [role="combobox"], [contenteditable="true"]')) return;
+      if (!link && n.localName === 'a') link = n;
+      if (n.classList.contains('test-id__field-value')) { valueEl = n; break; }
+      if (n.localName === 'records-record-layout-item' || n.localName === 'records-lwc-detail-panel') { insideLayout = true; break; }
+    }
+    if (!valueEl && !insideLayout) {
+      valueEl = valueAtPoint(e.clientX, e.clientY);
+      if (valueEl) link = deepQueryAll('a', valueEl).find((a) => pointIn(a, e.clientX, e.clientY)) || null;
+    }
+    if (!valueEl || !valueEl.classList.contains('slds-form-element__static')) return;
+    const root = closestDeep(valueEl, '.test-id__output-root');
+    if (root && root.classList.contains('recordlayout_in_editing_mode')) return;
+
+    if (link) { e.preventDefault(); e.stopPropagation(); }   // copy instead of calling / opening email
+    clearTimeout(copyTimer);
+    if (e.detail > 1) return;                               // 2nd click of a double click
+    if (String(window.getSelection ? window.getSelection() : '').trim()) return;   // user is selecting text
+
+    copyTimer = setTimeout(async () => {
+      const text = deepText(valueEl);
+      if (!text) { toast('This field is empty'); return; }
+      const ok = await copyText(text);
+      if (ok) { flash(valueEl, true); toast('Copied: ' + text); } else toast('Could not copy');
+    }, CONFIG.COPY_DELAY_MS);
+  }
+  function onDocDblClick() { clearTimeout(copyTimer); }
+
+  /* =====================================================================
+   * 8. STATUS COLORS
+   * ===================================================================== */
+  const normStatus = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const STATUS_MAP = new Map(Object.entries(CONFIG.STATUS_STYLES).map(([k, v]) => [normStatus(k), v]));
+  const onHighlightPage = () => CONFIG.HIGHLIGHT_PAGES.some((re) => re.test(location.pathname));
+  const CELL_SEL = 'td, th, [role="gridcell"], [role="rowheader"]';
+  const isStatusColumn = (cell) => CONFIG.STATUS_COLUMN_RE.test(cell.getAttribute('data-label') || '');
+
+  /** Table cell that contains `el` (crosses component borders). */
+  function cellOf(el) {
+    for (let n = el, i = 0; n && i < 50; i++) {
+      const c = n.closest ? n.closest(CELL_SEL) : null;
+      if (c) return c;
+      const root = n.getRootNode ? n.getRootNode() : null;
+      n = root && root.host ? root.host : null;
+    }
+    return null;
+  }
+
+  /**
+   * Status cells on the page -> status read from a title attribute ('' = read the text later).
+   * A cell counts if its column is "Status", or if it has no column name but holds a status title.
+   */
+  function findStatusCells() {
+    const cells = new Map();
+    const fromTitle = (el, title) => {
+      const cell = cellOf(el);
+      if (cell && (!cell.hasAttribute('data-label') || isStatusColumn(cell)) && !cells.get(cell)) cells.set(cell, title);
+    };
+    walkElements((el) => {
+      if (el.hasAttribute('data-label') && el.matches(CELL_SEL) && isStatusColumn(el) && !cells.has(el)) cells.set(el, '');
+      const t = el.getAttribute('title');
+      if (t && STATUS_MAP.has(normStatus(t)) && !el.closest('.sfx-ui')) fromTitle(el, t.trim());
+    });
+    if (!cells.size) {
+      for (const c of deepQueryAll('td[data-label], th[data-label], [role="gridcell"][data-label]')) if (isStatusColumn(c)) cells.set(c, '');
+      for (const t of deepQueryAll('[title]')) if (STATUS_MAP.has(normStatus(t.getAttribute('title')))) fromTitle(t, t.getAttribute('title').trim());
+    }
+    return cells;
+  }
+
+  function readStatus(cell, fromTitle) {
+    if (fromTitle) return fromTitle;
+    for (const t of deepQueryAll('[title]', cell)) {
+      const v = (t.getAttribute('title') || '').trim();
+      if (STATUS_MAP.has(normStatus(v))) return v;
+    }
+    return deepText(cell);
+  }
+
+  const painted = new Set();
+  function unpaint(cell) {
+    cell.style.removeProperty('background-color');
+    cell.style.removeProperty('border');
+    delete cell.dataset.sfxStatus;
+    painted.delete(cell);
+  }
+
+  function paint(cell, status) {
+    const style = STATUS_MAP.get(normStatus(status));
+    if (!style) { if (cell.dataset.sfxStatus !== undefined) unpaint(cell); return; }
+    // Salesforce redraws cells and can drop our style, so look at the real style every time.
+    const missing = !cell.style.getPropertyValue('background-color') || !cell.style.getPropertyValue('border-top-style');
+    if (missing || cell.dataset.sfxStatus !== status) {
+      cell.style.setProperty('background-color', style.bg, 'important');
+      cell.style.setProperty('border', style.border, 'important');
+      cell.dataset.sfxStatus = status;
+    }
+    painted.add(cell);
+  }
+
+  function applyHighlights() {
+    if (!onHighlightPage()) return;
+    const found = findStatusCells();
+    for (const [cell, title] of found) paint(cell, readStatus(cell, title));
+    for (const cell of [...painted]) {
+      if (!cell.isConnected) painted.delete(cell);
+      else if (!found.has(cell)) unpaint(cell);   // no longer a status cell
+    }
+  }
+
+  /** SFX.check() in the console: shows what the color code sees on this page. */
+  function statusCheck() {
+    const labels = new Map();
+    walkElements((el) => {
+      const l = el.getAttribute('data-label');
+      if (l && el.matches(CELL_SEL)) labels.set(l, (labels.get(l) || 0) + 1);
+    });
+    const viaSearch = deepQueryAll('td[data-label], th[data-label]').length;
+    const found = findStatusCells();
+    const rows = [...found].slice(0, 25).map(([cell, title]) => {
+      const status = readStatus(cell, title);
+      return {
+        column: cell.getAttribute('data-label') || '(none)',
+        status: status || '(empty)',
+        'has a color': STATUS_MAP.has(normStatus(status)) ? 'yes' : 'no',
+        'background now': getComputedStyle(cell).backgroundColor,
+        visible: isVisible(cell) ? 'yes' : 'no',
+      };
+    });
+    console.group(`[SF Helper v${VERSION}] status colors check`);
+    console.log('Page:', location.pathname);
+    console.log('Colors allowed on this page:', onHighlightPage() ? 'YES' : 'NO (page is not in HIGHLIGHT_PAGES)');
+    console.log('Table cells with a column name:', [...labels.values()].reduce((a, b) => a + b, 0), '| found by normal search:', viaSearch);
+    console.log('Column names on this page:', [...labels.keys()].slice(0, 40).join(' | ') || '(none)');
+    console.log('Status cells found:', found.size);
+    if (rows.length) console.table(rows);
+    console.groupEnd();
+    return found.size
+      ? `Found ${found.size} status cell(s). If they are still not colored, send a screenshot of this to Claude.`
+      : 'No status cells found. Send a screenshot of this, and the result of: copy(SFX.statusHtml())';
+  }
+
+  /** HTML of the first status row (or of the first status word) for troubleshooting. */
+  function statusHtml() {
+    const first = [...findStatusCells().keys()][0];
+    let el = first ? (first.closest('tr') || first) : null;
+    if (!el) {
+      walkElements((e) => { if (!el && !e.firstElementChild && STATUS_MAP.has(normStatus(physicalText(e)))) el = e; });
+      for (let i = 0; el && i < 8; i++) el = parentAcross(el) || el;
+    }
+    return el ? el.outerHTML.slice(0, 20000) : 'No status found on this page.';
+  }
+
+  /* =====================================================================
+   * 9. SCHEDULER (one throttled loop for everything)
+   * ===================================================================== */
+  let scanTimer = null;
+  let lastScan = 0;
+
+  function tick() {
+    scanTimer = null;
+    if (document.hidden) return;
+    lastScan = Date.now();
+    checkRoute();
+    const onForm = onAccountForm();
+    ui.fab.hidden = !onForm;
+    if (!onForm && !ui.panel.hidden) togglePanel(false);
+    document.documentElement.classList.toggle('sfx-copy-on', onRecordOf(CONFIG.COPY_ON));
+    try { applyHighlights(); } catch (e) { console.warn('[SF Helper] highlight error', e); }
+  }
+
+  function requestScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(tick, Math.max(0, CONFIG.SCAN_GAP_MS - (Date.now() - lastScan)));
+  }
+
+  function onKeyDown(e) {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === CONFIG.HOTKEY_CODE && onAccountForm()) {
+      e.preventDefault();
+      togglePanel();
+    }
+  }
+
+  /* =====================================================================
+   * 10. START / STOP
+   * ===================================================================== */
+  buildUI();
+  const observer = new MutationObserver(requestScan);
+  observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+  const heartbeat = setInterval(requestScan, CONFIG.HEARTBEAT_MS);
+  const onVisibility = () => { if (!document.hidden) requestScan(); };
+  document.addEventListener('click', onDocClick, true);
+  document.addEventListener('dblclick', onDocDblClick, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('paste', onDocPaste, true);
+  document.addEventListener('visibilitychange', onVisibility);
+  tick();
+
+  const api = {
+    version: VERSION,
+    parse: parseEvergent,
+    fill: (text) => runFill(text),
+    open: () => togglePanel(true),
+    check: statusCheck,
+    recolor: applyHighlights,
+    statusHtml,
+    countries: COUNTRIES,
+    destroy() {
+      observer.disconnect();
+      clearInterval(heartbeat);
+      clearTimeout(scanTimer);
+      clearTimeout(copyTimer);
+      clearTimeout(toastTimer);
+      document.removeEventListener('click', onDocClick, true);
+      document.removeEventListener('dblclick', onDocDblClick, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('paste', onDocPaste, true);
+      document.removeEventListener('visibilitychange', onVisibility);
+      document.documentElement.classList.remove('sfx-copy-on');
+      [ui.fab, ui.panel, ui.toast, ui.style].forEach((n) => n && n.remove());
+      if (window[NS] === api) delete window[NS];
+      if (window.SFX === api) delete window.SFX;
+    },
+  };
+  window[NS] = api;
+  window.SFX = api;
+  toast(`SF Helper v${VERSION} is on`, 2500);
+  console.info(`[SF Helper] v${VERSION} is on. Ctrl+V on an Account page fills from Evergent. Colors problem? Type: SFX.check()`);
+})();
